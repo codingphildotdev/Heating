@@ -5,25 +5,19 @@ import voluptuous_helper as vol_help
 from datetime import datetime, time, timedelta
 
 """
-Sets the thermostats target temperature and switches heating on and off. Also adds the current temperature and heating mode to the thermostats.
-For the documentation see https://github.com/bruxy70/Heating
+Turns the heating valves on or off according to the temperature sensors in every room.
+For the documentation see https://github.com/codingphildotdev/Heating
 """
 
 # Here you can change the modes set in the mode selector (in lower case)
 MODE_ON = "on"
 MODE_OFF = "off"
-MODE_AUTO = "auto"
-MODE_ECO = "eco"
 MODE_VACATION = "vacation"
 
-HYSTERESIS = 1.0  # Difference between the temperature to turn heating on and off (to avoid frequent switching)
-MIN_TEMPERATURE = 10  # Always turn on if teperature is below
+HYSTERESIS = 0.3  # Difference between the temperature to turn heating valves on and off (to avoid frequent switching)
 LOG_LEVEL = "INFO"
 
 # Other constants - do not change
-HVAC_HEAT = "heat"
-HVAC_OFF = "off"
-ATTR_SWITCH_HEATING = "switch_heating"
 ATTR_SOMEBODY_HOME = "somebody_home"
 ATTR_HEATING_MODE = "heating_mode"
 ATTR_TEMPERATURE_VACATION = "temperature_vacation"
@@ -32,8 +26,9 @@ ATTR_DAYNIGHT = "day_night"
 ATTR_TEMPERATURE_DAY = "temperature_day"
 ATTR_TEMPERATURE_NIGHT = "temperature_night"
 ATTR_SENSOR = "sensor"
-ATTR_THERMOSTATS = "thermostats"
-ATTR_NAME = "name"
+ATTR_HEATING_VALVES = "heating_valves"
+ATTR_MANUAL_MODE = "manual_mode"
+ATTR_ROOM_NAME = "room_name"
 ATTR_CURRENT_TEMP = "current_temperature"
 ATTR_HVAC_MODE = "hvac_mode"
 ATTR_HVAC_MODES = "hvac_modes"
@@ -50,12 +45,13 @@ class HeatingControl(hass.Hass):
         ROOM_SCHEMA = vol.Schema(
             {
                 vol.Required(ATTR_SENSOR): vol_help.existing_entity_id(self),
-                vol.Required(ATTR_DAYNIGHT): vol_help.existing_entity_id(self),
                 vol.Required(ATTR_TEMPERATURE_DAY): vol_help.existing_entity_id(self),
                 vol.Required(ATTR_TEMPERATURE_NIGHT): vol_help.existing_entity_id(self),
-                vol.Required(ATTR_THERMOSTATS): vol.All(
+                vol.Required(ATTR_HEATING_VALVES): vol.All(
                     vol_help.ensure_list, [vol_help.existing_entity_id(self)]
                 ),
+                vol.Required(ATTR_ROOM_NAME): str,
+                vol.Optional(ATTR_MANUAL_MODE): vol_help.existing_entity_id(self),
             },
         )
         APP_SCHEMA = vol.Schema(
@@ -63,7 +59,7 @@ class HeatingControl(hass.Hass):
                 vol.Required("module"): str,
                 vol.Required("class"): str,
                 vol.Required(ATTR_ROOMS): vol.All(vol_help.ensure_list, [ROOM_SCHEMA]),
-                vol.Required(ATTR_SWITCH_HEATING): vol_help.existing_entity_id(self),
+                vol.Required(ATTR_DAYNIGHT): vol_help.existing_entity_id(self),
                 vol.Required(ATTR_SOMEBODY_HOME): vol_help.existing_entity_id(self),
                 vol.Required(ATTR_TEMPERATURE_VACATION): vol_help.existing_entity_id(
                     self
@@ -81,57 +77,42 @@ class HeatingControl(hass.Hass):
             return
 
         # Read and store configuration
-        self.__switch_heating = config.get(ATTR_SWITCH_HEATING)
         self.__rooms = config.get(ATTR_ROOMS)
         self.__somebody_home = config.get(ATTR_SOMEBODY_HOME)
         self.__heating_mode = config.get(ATTR_HEATING_MODE)
         self.__temperature_vacation = config.get(ATTR_TEMPERATURE_VACATION)
+        self.__daynight = config.get(ATTR_DAYNIGHT)
 
         # Listen to events
         self.listen_state(self.somebody_home_changed, self.__somebody_home)
-        self.listen_state(self.heating_changed, self.__switch_heating)
         self.listen_state(
             self.vacation_temperature_changed, self.__temperature_vacation
         )
         self.listen_state(self.mode_changed, self.__heating_mode)
-        sensors = []
-        thermostats = []
-        # Listen to events for temperatuyre sensors and thermostats
+        self.listen_state(self.daynight_changed, self.__daynight)
+        # Listen to events for temperature sensors and heating_valves
         for room in self.__rooms:
-            self.listen_state(self.daynight_changed, room[ATTR_DAYNIGHT])
             self.listen_state(self.target_changed, room[ATTR_TEMPERATURE_DAY])
             self.listen_state(self.target_changed, room[ATTR_TEMPERATURE_NIGHT])
-            if room[ATTR_SENSOR] not in sensors:
-                sensor = room[ATTR_SENSOR]
-                sensors.append(sensor)
-                self.listen_state(self.temperature_changed, sensor)
-            for thermostat in room[ATTR_THERMOSTATS]:
-                if thermostat not in thermostats:
-                    thermostats.append(thermostat)
-                    self.listen_state(self.thermostat_changed, thermostat)
+            self.listen_state(self.temperature_changed, room[ATTR_SENSOR])
+            if ATTR_MANUAL_MODE in room:
+                self.listen_state(self.manual_mode_changed, room[ATTR_MANUAL_MODE])
+            else:
+                room[ATTR_MANUAL_MODE] = None
 
         # Initial update
-        self.__update_heating()
-        self.__update_thermostats()
+        self.__update_heating_valves()
         self.log("Ready for action...")
 
     def mode_changed(self, entity, attribute, old, new, kwargs):
-        """Event handler: mode changed on/off/auto/eco/vacation"""
-        heating = self.is_heating()
-        self.__update_heating()
-        if heating == self.is_heating():
-            self.log("Heating changed, updating thermostats")
-            self.__update_thermostats()
-
-    def heating_changed(self, entity, attribute, old, new, kwargs):
-        """Event handler: boiler state changed - update information on thermostats"""
-        self.__update_thermostats()
+        """Event handler: mode changed on/off/vacation"""
+        self.log("Heating changed, updating heating_valves")
+        self.__update_heating_valves()
 
     def vacation_temperature_changed(self, entity, attribute, old, new, kwargs):
         """Event handler: target vacation temperature"""
         if self.get_mode() == MODE_VACATION:
-            self.__update_heating()
-            self.__update_thermostats()
+            self.__update_heating_valves()
 
     def somebody_home_changed(self, entity, attribute, old, new, kwargs):
         """Event handler: house is empty / somebody came home"""
@@ -139,69 +120,37 @@ class HeatingControl(hass.Hass):
             self.log("Somebody came home.", level=self.__log_level)
         elif new.lower() == "off":
             self.log("Nobody home.", level=self.__log_level)
-        self.__update_heating(force=True)
-        self.__update_thermostats()
-
-    def thermostat_changed(self, entity, attribute, old, new, kwargs):
-        """Event handler: make sure thermostats do not get blank"""
-        if new is None or new == ATTR_UNKNOWN or new == ATTR_UNAVAILABLE:
-            self.__update_thermostats(thermostat_entity=entity)
+        self.__update_heating_valves()
 
     def temperature_changed(self, entity, attribute, old, new, kwargs):
         """Event handler: target temperature changed"""
-        self.__update_heating()
-        self.__update_thermostats(sensor_entity=entity)
+        self.__update_heating_valves(sensor_entity=entity)
 
     def daynight_changed(self, entity, attribute, old, new, kwargs):
         """Event handler: day/night changed"""
-        self.__update_heating()
         self.log("updating daynight")
-        for room in self.__rooms:
-            if room[ATTR_DAYNIGHT] == entity:
-                self.log(f"for sensor {room[ATTR_SENSOR]}")
-                self.__update_thermostats(sensor_entity=room[ATTR_SENSOR])
+        self.__update_heating_valves()
 
     def target_changed(self, entity, attribute, old, new, kwargs):
         """Event handler: target temperature"""
-        self.__update_heating()
         for room in self.__rooms:
             if (
                 room[ATTR_TEMPERATURE_DAY] == entity
                 or room[ATTR_TEMPERATURE_NIGHT] == entity
             ):
-                self.__update_thermostats(sensor_entity=room[ATTR_SENSOR])
+                self.__update_heating_valves(sensor_entity=room[ATTR_SENSOR])
 
-    def __check_temperature(self) -> (float, bool, bool):
-        """Check temperature of all sensors. Are some bellow? Are all above? What is the minimum temperature"""
-        some_below = False
-        all_above = True
-        minimum = None
-        vacation_temperature = float(self.get_state(self.__temperature_vacation))
-        for room in self.__rooms:
-            sensor_data = self.get_state(room[ATTR_SENSOR])
-            if (
-                sensor_data is None
-                or sensor_data == ATTR_UNKNOWN
-                or sensor_data == ATTR_UNAVAILABLE
-            ):
-                continue
-            temperature = float(sensor_data)
-            if self.get_mode() == MODE_VACATION:
-                target = vacation_temperature
-            else:
-                target = self.__get_target_room_temp(room)
-            if temperature < target:
-                all_above = False
-            elif temperature < (target - HYSTERESIS):
-                some_below = True
-            if minimum == None or temperature < minimum:
-                minimum = temperature
-        return minimum, some_below, all_above
+    def manual_mode_changed(self, entity, attribute, old, new, kwargs):
+        """Event handler: manual mode in room changed"""
+        self.log(f"Manual mode room {entity} new value: {new}")
+        self.__update_heating_valves()
 
-    def is_heating(self) -> bool:
-        """Is teh boiler heating?"""
-        return bool(self.get_state(self.__switch_heating).lower() == "on")
-
+    def is_manual_mode_on(self, room) -> bool:
+        """Is manual mode on?"""
+        if(room[ATTR_MANUAL_MODE] is not None):
+            self.log(f"Manual mode {room[ATTR_MANUAL_MODE]} is {self.get_state(room[ATTR_MANUAL_MODE])}")
+            return bool(self.get_state(room[ATTR_MANUAL_MODE]) == "on")
+    
     def is_somebody_home(self) -> bool:
         """Is somebody home?"""
         return bool(self.get_state(self.__somebody_home).lower() == "on")
@@ -210,116 +159,61 @@ class HeatingControl(hass.Hass):
         """Get heating mode off/on/auto/eco/vacation"""
         return self.get_state(self.__heating_mode).lower()
 
-    def __set_heating(self, heat: bool):
-        """Set the relay on/off"""
-        is_heating = self.is_heating()
-        if heat:
-            if not is_heating:
-                self.log("Turning heating on.", level=self.__log_level)
-                self.turn_on(self.__switch_heating)
-        else:
-            if is_heating:
-                self.log("Turning heating off.", level=self.__log_level)
-                self.turn_off(self.__switch_heating)
-
-    def __set_thermostat(
-        self, entity_id: str, target_temp: float, current_temp: float, mode: str
+    def __set_heating_valves(
+        self, entity_id: str, target_temp: float, current_temp: float
     ):
+        """Check if Heating is off"""
+        if(self.get_mode() == MODE_OFF):
+            self.log("Heating mode is OFF")
+            self.call_service("switch/turn_off", entity_id=entity_id)
+            self.log(f"Turn off: {entity_id}")
+            return None
         """Set the thermostat attrubutes and state"""
         if target_temp is None:
-            target_temp = self.__get_target_temp(termostat=entity_id)
+            target_temp = self.__get_target_temp(sensor=entity_id)
         if current_temp is None:
-            current_temp = self.__get_current_temp(termostat=entity_id)
-        if mode is None:
-            if self.is_heating():
-                mode = HVAC_HEAT
-            else:
-                mode = HVAC_OFF
+            current_temp = self.__get_current_temp(sensor=entity_id)
         self.log(
-            f"Updating thermostat {entity_id}: "
+            f"Updating heating valve {entity_id}: "
             f"temperature {target_temp}, "
-            f"mode {mode}, "
             f"current temperature {current_temp}."
         )
-        if current_temp is not None and target_temp is not None and mode is not None:
-            attrs = {}
-            attrs[ATTR_CURRENT_TEMP] = current_temp
-            attrs[ATTR_TEMPERATURE] = target_temp
-            attrs[ATTR_HVAC_MODE] = mode
-            attrs[ATTR_HVAC_MODES] = [HVAC_HEAT, HVAC_OFF]
-            self.set_state(entity_id, state=mode, attributes=attrs)
-            self.call_service(
-                "climate/set_temperature", entity_id=entity_id, temperature=target_temp
-            )
+        if current_temp is not None and target_temp > (current_temp + HYSTERESIS):
+            self.call_service("switch/turn_on", entity_id=entity_id)
+            self.log(f"Turn on: {entity_id}")
+        if current_temp is not None and target_temp <= current_temp:
+            self.call_service("switch/turn_off", entity_id=entity_id)
+            self.log(f"Turn off: {entity_id}")
+            self.log(" ")
 
     def __get_target_room_temp(self, room) -> float:
         """Returns target room temparture, based on day/night switch (not considering vacation)"""
-        if bool(self.get_state(room[ATTR_DAYNIGHT]).lower() == "on"):
+        if bool(self.get_state(self.__daynight).lower() == "on"):
             return float(self.get_state(room[ATTR_TEMPERATURE_DAY]))
         else:
             return float(self.get_state(room[ATTR_TEMPERATURE_NIGHT]))
 
-    def __get_target_temp(self, sensor: str = None, termostat: str = None) -> float:
+    def __get_target_temp(self, sensor: str = None) -> float:
         """Get target temperature (basd on day/night/vacation)"""
         if self.get_mode() == MODE_VACATION:
             return float(self.get_state(self.__temperature_vacation))
-        if sensor is None and termostat is None:
+        if sensor is None:
             return None
         for room in self.__rooms:
-            if sensor is not None:
-                if room[ATTR_SENSOR] == sensor:
-                    return self.__get_target_room_temp(room)
-            else:
-                if termostat in room[ATTR_THERMOSTATS]:
-                    return self.__get_target_room_temp(room)
-        return None
+            if room[ATTR_SENSOR] == sensor:
+                return self.__get_target_room_temp(room)
+        return None 
 
-    def __get_current_temp(self, sensor: str = None, termostat: str = None) -> float:
+    def __get_current_temp(self, sensor: str = None) -> float:
         """Get current temperature (from temperature sensor)"""
         if sensor is not None:
             return float(self.get_state(sensor))
-        if termostat is None:
-            return None
         for room in self.__rooms:
-            if termostat in room[ATTR_THERMOSTATS]:
+            if sensor in room[ATTR_SENSOR]:
                 return float(self.get_state(room[ATTR_SENSOR]))
         return None
 
-    def __update_heating(self, force: bool = False):
-        """Turn boiled on/off"""
-        minimum, some_below, all_above = self.__check_temperature()
-        mode = self.get_mode()
-
-        if minimum < MIN_TEMPERATURE:
-            self.__set_heating(True)
-            return
-        if mode == MODE_ON:
-            self.__set_heating(True)
-            return
-        if mode == MODE_OFF:
-            self.__set_heating(False)
-            return
-        if mode == MODE_AUTO and self.is_somebody_home():
-            self.__set_heating(True)
-            return
-        if force:
-            if self.is_somebody_home():
-                if not all_above:
-                    self.__set_heating(True)
-            else:
-                if not some_below:
-                    self.__set_heating(False)
-        else:
-            if self.is_heating():
-                if all_above:
-                    self.__set_heating(False)
-            else:
-                if some_below:
-                    self.__set_heating(True)
-
-    def __update_thermostats(
-        self, thermostat_entity: str = None, sensor_entity: str = None
-    ):
+    def __update_heating_valves(self, thermostat_entity: str = None, sensor_entity: str = None):
         """Set the thermostats target temperature, current temperature and heating mode"""
         vacation = self.get_mode() == MODE_VACATION
         vacation_temperature = float(self.get_state(self.__temperature_vacation))
@@ -327,22 +221,21 @@ class HeatingControl(hass.Hass):
         for room in self.__rooms:
             if (
                 (thermostat_entity is None and sensor_entity is None)
-                or (thermostat_entity in room[ATTR_THERMOSTATS])
+                or (thermostat_entity in room[ATTR_HEATING_VALVES])
                 or (sensor_entity == room[ATTR_SENSOR])
             ):
+                self.log(f"Room: {room[ATTR_ROOM_NAME]}")
+                if self.is_manual_mode_on(room):
+                    continue
                 self.log(f"updating sensor {room[ATTR_SENSOR]}")
                 temperature = float(self.get_state(room[ATTR_SENSOR]))
                 target_temperature = self.__get_target_room_temp(room)
-                if self.is_heating():
-                    mode = HVAC_HEAT
-                else:
-                    mode = HVAC_OFF
-                for thermostat in room[ATTR_THERMOSTATS]:
+                for heating_valve in room[ATTR_HEATING_VALVES]:
                     if vacation:
-                        self.__set_thermostat(
-                            thermostat, vacation_temperature, temperature, mode
+                        self.__set_heating_valves(
+                            heating_valve, vacation_temperature, temperature
                         )
                     else:
-                        self.__set_thermostat(
-                            thermostat, target_temperature, temperature, mode
+                        self.__set_heating_valves(
+                            heating_valve, target_temperature, temperature
                         )
